@@ -440,19 +440,17 @@ func (r *ClusterPolicyEndpointsReconciler) updateClusterPolicyEnforcementStatusF
 func (r *ClusterPolicyEndpointsReconciler) cleanupClusterPolicyPod(ctx context.Context, targetPod npatypes.Pod, clusterPolicyEndpoint string, isDeleteFlow bool) error {
 	podIdentifier := utils.GetPodIdentifier(targetPod.Name, targetPod.Namespace)
 
-	if _, ok := r.podIdentifierToClusterPolicyEndpointMap.Load(podIdentifier); ok {
-		clusterPolicyIngressRules, clusterPolicyEgressRules, err := r.deriveClusterPolicyIngressAndEgressFirewallRules(ctx, podIdentifier, clusterPolicyEndpoint, isDeleteFlow)
-		if err != nil {
-			log().Errorf("Error Parsing cluster policy Endpoint resource %s: %v", clusterPolicyEndpoint, err)
-			return err
-		}
+	clusterPolicyIngressRules, clusterPolicyEgressRules, err := r.deriveClusterPolicyIngressAndEgressFirewallRules(ctx, podIdentifier, clusterPolicyEndpoint, isDeleteFlow)
+	if err != nil {
+		log().Errorf("Error Parsing cluster policy Endpoint resource %s: %v", clusterPolicyEndpoint, err)
+		return err
+	}
 
-		// No catch-all rules for cluster policies - just update with remaining rules
-		err = r.updateClusterPolicyBPFMaps(podIdentifier, clusterPolicyIngressRules, clusterPolicyEgressRules)
-		if err != nil {
-			log().Errorf("cluster policy map update(s) failed for podIdentifier %s: %v", podIdentifier, err)
-			return err
-		}
+	// No catch-all rules for cluster policies - just update with remaining rules
+	err = r.updateClusterPolicyBPFMaps(podIdentifier, clusterPolicyIngressRules, clusterPolicyEgressRules)
+	if err != nil {
+		log().Errorf("cluster policy map update(s) failed for podIdentifier %s: %v", podIdentifier, err)
+		return err
 	}
 	return nil
 }

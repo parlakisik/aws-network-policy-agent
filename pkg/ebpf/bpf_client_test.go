@@ -529,7 +529,7 @@ func TestBpfClient_AttacheBPFProbes(t *testing.T) {
 				return fmt.Sprintf("mockedveth%d", interfaceIndex), nil
 			}
 
-			gotError := testBpfClient.AttacheBPFProbes(tt.testPod, tt.podIdentifier, tt.numInterfaces)
+			_, gotError := testBpfClient.AttacheBPFProbes(tt.testPod, tt.podIdentifier, tt.numInterfaces, false)
 			assert.Equal(t, tt.wantErr, gotError)
 		})
 	}
@@ -912,7 +912,7 @@ func TestBpfClient_AttacheBPFProbes_MultipleInterfacesFlow(t *testing.T) {
 		return fmt.Sprintf("mockedveth%d", interfaceIndex), nil
 	}
 
-	err := testBpfClient.AttacheBPFProbes(testPod, podIdentifier, 2)
+	_, err := testBpfClient.AttacheBPFProbes(testPod, podIdentifier, 2, false)
 	assert.NoError(t, err)
 
 	podNamespacedName := utils.GetPodNamespacedName(testPod.Name, testPod.Namespace)
@@ -1179,8 +1179,110 @@ func TestAttacheBPFProbes_SkipsDeletedPod(t *testing.T) {
 	pod := types.NamespacedName{Name: "nginx-abc123", Namespace: "default"}
 	testBpfClient.deletedPods.Store(utils.GetPodNamespacedName(pod.Name, pod.Namespace), time.Now())
 
-	err := testBpfClient.AttacheBPFProbes(pod, utils.GetPodIdentifier(pod.Name, pod.Namespace), 1)
+	attached, err := testBpfClient.AttacheBPFProbes(pod, utils.GetPodIdentifier(pod.Name, pod.Namespace), 1, false)
 	assert.NoError(t, err)
+	assert.False(t, attached, "a skipped attach must not report itself as attached")
+}
+
+// A caller with authoritative evidence the pod exists (a CNI ADD) must never be
+// vetoed by a stale tombstone: skipping would leave a live pod with no probes,
+// unenforced, while the RPC still reported success.
+func TestAttacheBPFProbes_ProceedsWhenPodConfirmedLive(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockTCClient := mock_tc.NewMockBpfTc(ctrl)
+	mockTCClient.EXPECT().TCIngressAttach(gomock.Any(), gomock.Any(), gomock.Any()).Times(1)
+	mockTCClient.EXPECT().TCEgressAttach(gomock.Any(), gomock.Any(), gomock.Any()).Times(1)
+
+	mockBpfSDK := mock_bpfclient.NewMockBpfSDKClient(ctrl)
+	mockBpfSDK.EXPECT().LoadBpfFile(gomock.Any(), gomock.Any()).AnyTimes()
+
+	pod := types.NamespacedName{Name: "nginx-abc123", Namespace: "default"}
+	podIdentifier := utils.GetPodIdentifier(pod.Name, pod.Namespace)
+	podNamespacedName := utils.GetPodNamespacedName(pod.Name, pod.Namespace)
+
+	testBpfClient := newAttachTestClient(t, podIdentifier, mockBpfSDK, mockTCClient)
+
+	// A tombstone is present and is NOT cleared beforehand: the attach itself must
+	// drop it, under the lock, because the caller knows the pod is live.
+	testBpfClient.deletedPods.Store(podNamespacedName, time.Now())
+
+	attached, err := testBpfClient.AttacheBPFProbes(pod, podIdentifier, 1, true)
+	assert.NoError(t, err)
+	assert.True(t, attached)
+
+	_, ingressAttached := testBpfClient.ingressPodToProgMap.Load(podNamespacedName)
+	assert.True(t, ingressAttached)
+	_, tombstoneStillSet := testBpfClient.deletedPods.Load(podNamespacedName)
+	assert.False(t, tombstoneStillSet, "a confirmed-live attach must clear the stale tombstone")
+}
+
+// A pod deleted while an attach is blocked on podIdentifierLock must not be
+// re-attached once the lock is released. The tombstone check before the lock can
+// be stale, so re-inserting here would leave the pod in ingressProgToPodsMap
+// forever — nothing removes it again — keeping isProgFdShared true for the last
+// pod of the podIdentifier and leaking its pinned programs and maps.
+func TestAttacheBPFProbes_SkipsPodDeletedWhileWaitingForLock(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockTCClient := mock_tc.NewMockBpfTc(ctrl)
+	mockTCClient.EXPECT().TCIngressAttach(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+	mockTCClient.EXPECT().TCEgressAttach(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+
+	mockBpfSDK := mock_bpfclient.NewMockBpfSDKClient(ctrl)
+	mockBpfSDK.EXPECT().LoadBpfFile(gomock.Any(), gomock.Any()).AnyTimes()
+
+	pod := types.NamespacedName{Name: "churn-abc123", Namespace: "leak-test"}
+	podIdentifier := utils.GetPodIdentifier(pod.Name, pod.Namespace)
+	podNamespacedName := utils.GetPodNamespacedName(pod.Name, pod.Namespace)
+
+	testBpfClient := newAttachTestClient(t, podIdentifier, mockBpfSDK, mockTCClient)
+
+	// Hold the identifier lock so the attach below parks on it, standing in for an
+	// in-flight DeleteBPFProbes which holds this same lock.
+	releaseHeldLock := testBpfClient.lockPodIdentifier(podIdentifier)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := testBpfClient.AttacheBPFProbes(pod, podIdentifier, 1, false)
+		done <- err
+	}()
+
+	// Wait until the attach is provably parked on the lock rather than sleeping a
+	// fixed interval and hoping. refs == 2 means the held lock plus one waiter, so
+	// the goroutine is past the pre-lock check and blocked on Lock() -- which is
+	// what makes this a test of the post-lock check and not of the pre-lock one.
+	require.Eventually(t, func() bool {
+		return testBpfClient.podIdentifierLockRefs(podIdentifier) == 2
+	}, 5*time.Second, time.Millisecond, "attach goroutine never parked on podIdentifierLock")
+
+	select {
+	case <-done:
+		releaseHeldLock()
+		t.Fatal("AttacheBPFProbes returned while the lock was held; test cannot validate the post-lock check")
+	default:
+	}
+
+	// DeleteBPFProbes would have recorded this while holding the lock.
+	testBpfClient.deletedPods.Store(podNamespacedName, time.Now())
+	releaseHeldLock()
+
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("AttacheBPFProbes did not return after podIdentifierLock was released")
+	}
+
+	// The pod must not have been re-registered against the shared program.
+	_, attached := testBpfClient.ingressPodToProgMap.Load(podNamespacedName)
+	assert.False(t, attached, "deleted pod was re-inserted into ingressPodToProgMap")
+	_, egressAttached := testBpfClient.egressPodToProgMap.Load(podNamespacedName)
+	assert.False(t, egressAttached, "deleted pod was re-inserted into egressPodToProgMap")
+	// The refcount, not the podToProg maps, is what leaks the pins.
+	assertNotInProgSets(t, testBpfClient, podNamespacedName)
 }
 
 // Releasing the identifier lock must not orphan a goroutine that is already
@@ -1218,6 +1320,29 @@ func TestLockPodIdentifier_SameLockInstanceWhileContended(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return c.podIdentifierLockRefs(podIdentifier) == 0
 	}, 5*time.Second, time.Millisecond, "lock entry was not reclaimed once idle")
+}
+
+// The deletedPods GC must not retire a tombstone while a goroutine holds or
+// waits for the matching identifier lock: a parked AttacheBPFProbes re-reads the
+// tombstone after acquiring the lock, and retiring it first would let that
+// attach through and re-insert an already-deleted pod.
+func TestCleanupDeletedPods_KeepsTombstoneWhileIdentifierLockHeld(t *testing.T) {
+	c := &bpfClient{deletedPods: new(sync.Map)}
+
+	pod := types.NamespacedName{Name: "web-abc123-xyz", Namespace: "default"}
+	podIdentifier := utils.GetPodIdentifier(pod.Name, pod.Namespace)
+	podNamespacedName := utils.GetPodNamespacedName(pod.Name, pod.Namespace)
+	c.deletedPods.Store(podNamespacedName, time.Now().Add(-2*deletedPodsMinAge))
+
+	release := c.lockPodIdentifier(podIdentifier)
+	c.cleanupDeletedPodsIfNeeded()
+	_, stillPresent := c.deletedPods.Load(podNamespacedName)
+	assert.True(t, stillPresent, "tombstone was retired while the identifier lock was held")
+
+	release()
+	c.cleanupDeletedPodsIfNeeded()
+	_, present := c.deletedPods.Load(podNamespacedName)
+	assert.False(t, present, "expired tombstone should be collected once the lock is idle")
 }
 
 // Drives concurrent attaches and deletes across one podIdentifier so the race
@@ -1277,7 +1402,9 @@ func TestAttachDeleteConcurrentOnOneIdentifier(t *testing.T) {
 					Name:      fmt.Sprintf("web-abc123-w%dn%d", w, i),
 					Namespace: "default",
 				}
-				if err := testBpfClient.AttacheBPFProbes(pod, podIdentifier, 1); err != nil {
+				// podConfirmedLive=true mirrors the CNI ADD path, which must not be
+				// vetoed by another pod's tombstone.
+				if _, err := testBpfClient.AttacheBPFProbes(pod, podIdentifier, 1, true); err != nil {
 					t.Errorf("attach failed for %s: %v", pod.Name, err)
 					return
 				}

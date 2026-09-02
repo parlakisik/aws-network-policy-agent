@@ -170,6 +170,18 @@ func GetPodNamespacedName(podName, podNamespace string) string {
 	return podName + "_" + podNamespace
 }
 
+// GetPodIdentifierFromNamespacedName maps a key produced by
+// GetPodNamespacedName back to the pod's identifier. Because "_" is forbidden in
+// both DNS-1123 pod names and namespaces, the separator is unambiguous. Returns
+// "" if s is not a well-formed namespaced name.
+func GetPodIdentifierFromNamespacedName(s string) string {
+	sep := strings.LastIndex(s, "_")
+	if sep < 0 {
+		return ""
+	}
+	return GetPodIdentifier(s[:sep], s[sep+1:])
+}
+
 // Separator is "@" because it is illegal in DNS-1123 pod names and namespaces,
 // making the identifier injective on (podName-prefix, podNamespace). "@" also
 // keeps pin filenames parseable by aws-ebpf-sdk-go, which splits on the first

@@ -15,6 +15,7 @@ package rpc
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 
@@ -83,10 +84,22 @@ func (s *server) EnforceNpToPod(ctx context.Context, in *rpc.EnforceNpRequest) (
 	podIdentifier := utils.GetPodIdentifier(in.K8S_POD_NAME, in.K8S_POD_NAMESPACE)
 	isFirstPodInPodIdentifier := s.policyReconciler.GeteBPFClient().IsFirstPodInPodIdentifier(podIdentifier)
 	s.policyReconciler.GeteBPFClient().ClearDeletedPod(utils.GetPodNamespacedName(in.K8S_POD_NAME, in.K8S_POD_NAMESPACE))
-	err = s.policyReconciler.GeteBPFClient().AttacheBPFProbes(types.NamespacedName{Name: in.K8S_POD_NAME, Namespace: in.K8S_POD_NAMESPACE},
-		podIdentifier, int(in.InterfaceCount))
+	// A CNI ADD is authoritative evidence that the pod exists, so pass
+	// podConfirmedLive=true: any deletion tombstone is stale and is dropped under
+	// podIdentifierLock rather than being allowed to veto this attach. Skipping
+	// here would leave a live pod with no probes while we still reported success.
+	attached, err := s.policyReconciler.GeteBPFClient().AttacheBPFProbes(types.NamespacedName{Name: in.K8S_POD_NAME, Namespace: in.K8S_POD_NAMESPACE},
+		podIdentifier, int(in.InterfaceCount), true)
 	if err != nil {
 		log().Errorf("Attaching eBPF probe failed for pod: %s namespace: %s, error: %v", in.K8S_POD_NAME, in.K8S_POD_NAMESPACE, err)
+		return nil, err
+	}
+	if !attached {
+		// Unreachable while podConfirmedLive is true, but must never degrade into a
+		// silent success: the map updates below assume the pod has a BPF context, and
+		// the CNI would otherwise treat an unenforced pod as programmed.
+		err = fmt.Errorf("eBPF probes were not attached for pod %s in namespace %s", in.K8S_POD_NAME, in.K8S_POD_NAMESPACE)
+		log().Errorf("Refusing to report success: %v", err)
 		return nil, err
 	}
 	var podState, clusterPolicyState int

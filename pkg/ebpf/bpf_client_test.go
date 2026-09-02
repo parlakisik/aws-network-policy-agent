@@ -22,6 +22,7 @@ import (
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	// "unsafe"
@@ -479,7 +480,6 @@ func TestBpfClient_AttacheBPFProbes(t *testing.T) {
 			egressPodToProgMap:        new(sync.Map),
 			ingressProgToPodsMap:      new(sync.Map),
 			egressProgToPodsMap:       new(sync.Map),
-			podIdentifierLock:         new(sync.Map),
 			deletedPods:               new(sync.Map),
 		}
 
@@ -489,6 +489,7 @@ func TestBpfClient_AttacheBPFProbes(t *testing.T) {
 		}
 		testBpfClient.policyEndpointeBPFContext.Store(tt.podIdentifier, sampleBPFContext)
 
+		restoreGetHostVethName(t)
 		utils.GetHostVethName = func(podName, podNamespace string, interfaceIndex int, interfacePrefixes []string) (string, error) {
 			return "mockedveth0", nil
 		}
@@ -512,7 +513,6 @@ func TestBpfClient_AttacheBPFProbes(t *testing.T) {
 				egressPodToProgMap:        new(sync.Map),
 				ingressProgToPodsMap:      new(sync.Map),
 				egressProgToPodsMap:       new(sync.Map),
-				podIdentifierLock:         new(sync.Map),
 				isMultiNICEnabled:         tt.isMultiNICEnabled,
 				podNameToInterfaceCount:   new(sync.Map),
 				deletedPods:               new(sync.Map),
@@ -524,6 +524,7 @@ func TestBpfClient_AttacheBPFProbes(t *testing.T) {
 			}
 			testBpfClient.policyEndpointeBPFContext.Store(tt.podIdentifier, sampleBPFContext)
 
+			restoreGetHostVethName(t)
 			utils.GetHostVethName = func(podName, podNamespace string, interfaceIndex int, interfacePrefixes []string) (string, error) {
 				return fmt.Sprintf("mockedveth%d", interfaceIndex), nil
 			}
@@ -900,13 +901,13 @@ func TestBpfClient_AttacheBPFProbes_MultipleInterfacesFlow(t *testing.T) {
 		egressPodToProgMap:        new(sync.Map),
 		ingressProgToPodsMap:      new(sync.Map),
 		egressProgToPodsMap:       new(sync.Map),
-		podIdentifierLock:         new(sync.Map),
 		isMultiNICEnabled:         true,
 		ingressBinary:             "tc.v4ingress.bpf.o",
 		egressBinary:              "tc.v4egress.bpf.o",
 		deletedPods:               new(sync.Map),
 	}
 
+	restoreGetHostVethName(t)
 	utils.GetHostVethName = func(podName, podNamespace string, interfaceIndex int, interfacePrefixes []string) (string, error) {
 		return fmt.Sprintf("mockedveth%d", interfaceIndex), nil
 	}
@@ -1098,6 +1099,70 @@ func TestIsProgFdShared(t *testing.T) {
 	}
 }
 
+// restoreGetHostVethName registers cleanup that puts the package-level
+// utils.GetHostVethName back after a test replaces it. Without this a stub leaks
+// into every later test in the package and results become order-dependent.
+func restoreGetHostVethName(t *testing.T) {
+	original := utils.GetHostVethName
+	t.Cleanup(func() { utils.GetHostVethName = original })
+}
+
+// newAttachTestClient builds a bpfClient wired for the AttacheBPFProbes tests,
+// with a BPFContext already registered for podIdentifier so the attach re-uses
+// ingress progFD 3 / egress progFD 5 instead of loading an ELF.
+func newAttachTestClient(t *testing.T, podIdentifier string, sdk *mock_bpfclient.MockBpfSDKClient, tc *mock_tc.MockBpfTc) *bpfClient {
+	t.Helper()
+	c := &bpfClient{
+		hostMask:                  "/32",
+		policyEndpointeBPFContext: new(sync.Map),
+		bpfSDKClient:              sdk,
+		bpfTCClient:               tc,
+		ingressPodToProgMap:       new(sync.Map),
+		egressPodToProgMap:        new(sync.Map),
+		ingressProgToPodsMap:      new(sync.Map),
+		egressProgToPodsMap:       new(sync.Map),
+		podNameToInterfaceCount:   new(sync.Map),
+		deletedPods:               new(sync.Map),
+		// Needed by deleteBPFProbes, so an attach/delete round trip does not nil
+		// dereference. Every sync.Map field AttacheBPFProbes or DeleteBPFProbes can
+		// reach must be initialized here.
+		ingressInMemoryMap:              new(sync.Map),
+		egressInMemoryMap:               new(sync.Map),
+		clusterPolicyIngressInMemoryMap: new(sync.Map),
+		clusterPolicyEgressInMemoryMap:  new(sync.Map),
+		globalMaps:                      new(sync.Map),
+	}
+	c.policyEndpointeBPFContext.Store(podIdentifier, BPFContext{
+		ingressPgmInfo: goelf.BpfData{Program: goebpfprogs.BpfProgram{ProgID: 2, ProgFD: 3}},
+		egressPgmInfo:  goelf.BpfData{Program: goebpfprogs.BpfProgram{ProgID: 4, ProgFD: 5}},
+	})
+	restoreGetHostVethName(t)
+	utils.GetHostVethName = func(_, _ string, _ int, _ []string) (string, error) {
+		return "mockedveth0", nil
+	}
+	return c
+}
+
+// assertNotInProgSets checks the pod is absent from the progFD -> pods sets.
+// These, not the podToProg maps, are what isProgFdShared counts, so they are the
+// structures whose corruption produces the pin leak.
+func assertNotInProgSets(t *testing.T, c *bpfClient, podNamespacedName string) {
+	t.Helper()
+	for _, m := range []struct {
+		name   string
+		set    *sync.Map
+		progFD int
+	}{
+		{"ingressProgToPodsMap", c.ingressProgToPodsMap, 3},
+		{"egressProgToPodsMap", c.egressProgToPodsMap, 5},
+	} {
+		if raw, ok := m.set.Load(m.progFD); ok {
+			_, present := raw.(map[string]struct{})[podNamespacedName]
+			assert.False(t, present, "deleted pod was re-inserted into %s", m.name)
+		}
+	}
+}
+
 func TestAttacheBPFProbes_SkipsDeletedPod(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -1107,9 +1172,8 @@ func TestAttacheBPFProbes_SkipsDeletedPod(t *testing.T) {
 	mockTCClient.EXPECT().TCEgressAttach(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
 
 	testBpfClient := &bpfClient{
-		podIdentifierLock: new(sync.Map),
-		deletedPods:       new(sync.Map),
-		bpfTCClient:       mockTCClient,
+		deletedPods: new(sync.Map),
+		bpfTCClient: mockTCClient,
 	}
 
 	pod := types.NamespacedName{Name: "nginx-abc123", Namespace: "default"}
@@ -1119,50 +1183,131 @@ func TestAttacheBPFProbes_SkipsDeletedPod(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestAttacheBPFProbes_ProceedsAfterClearDeletedPod(t *testing.T) {
+// Releasing the identifier lock must not orphan a goroutine that is already
+// waiting on it. Deleting a held lock entry used to let the next caller mint a
+// second mutex for the same podIdentifier and enter the critical section
+// concurrently, which silently defeats the tombstone re-check above.
+func TestLockPodIdentifier_SameLockInstanceWhileContended(t *testing.T) {
+	c := &bpfClient{}
+	const podIdentifier = "web-abc123@default"
+
+	release := c.lockPodIdentifier(podIdentifier)
+	assert.Equal(t, 1, c.podIdentifierLockRefs(podIdentifier))
+
+	entered := make(chan struct{})
+	go func() {
+		innerRelease := c.lockPodIdentifier(podIdentifier)
+		close(entered)
+		innerRelease()
+	}()
+
+	require.Eventually(t, func() bool {
+		return c.podIdentifierLockRefs(podIdentifier) == 2
+	}, 5*time.Second, time.Millisecond, "second caller never registered as a waiter")
+
+	select {
+	case <-entered:
+		t.Fatal("second caller entered the critical section while the lock was held")
+	default:
+	}
+
+	release()
+	<-entered
+
+	// Fully released: the entry is reclaimed so the registry does not grow without bound.
+	require.Eventually(t, func() bool {
+		return c.podIdentifierLockRefs(podIdentifier) == 0
+	}, 5*time.Second, time.Millisecond, "lock entry was not reclaimed once idle")
+}
+
+// Drives concurrent attaches and deletes across one podIdentifier so the race
+// detector can see the progFD -> pods sets. Those inner values are plain Go
+// maps, and concurrent access to a plain map is a fatal runtime throw that takes
+// the whole agent down, so this must be exercised under -race rather than
+// reasoned about. Run with: go test -race -run TestAttachDeleteConcurrent ./pkg/ebpf/
+func TestAttachDeleteConcurrentOnOneIdentifier(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
 	mockTCClient := mock_tc.NewMockBpfTc(ctrl)
-	mockTCClient.EXPECT().TCIngressAttach(gomock.Any(), gomock.Any(), gomock.Any()).Times(1)
-	mockTCClient.EXPECT().TCEgressAttach(gomock.Any(), gomock.Any(), gomock.Any()).Times(1)
+	mockTCClient.EXPECT().TCIngressAttach(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+	mockTCClient.EXPECT().TCEgressAttach(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+	mockTCClient.EXPECT().TCIngressDetach(gomock.Any()).AnyTimes()
+	mockTCClient.EXPECT().TCEgressDetach(gomock.Any()).AnyTimes()
 
+	// Every pod of a ReplicaSet shares one identifier, so pods churning under a
+	// single identifier is the steady state for any rolling Deployment.
+	const podIdentifier = "web-abc123@default"
+
+	// The first delete of each cycle drops policyEndpointeBPFContext, so later
+	// attaches take the load-from-ELF path. Return program data keyed by the pin
+	// paths the loader looks up, otherwise every attach after the first fails.
 	mockBpfSDK := mock_bpfclient.NewMockBpfSDKClient(ctrl)
-	mockBpfSDK.EXPECT().LoadBpfFile(gomock.Any(), gomock.Any()).AnyTimes()
+	mockBpfSDK.EXPECT().LoadBpfFile(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_, _ string) (map[string]goelf.BpfData, map[string]goebpfmaps.BpfMap, error) {
+			return map[string]goelf.BpfData{
+				utils.GetBPFPinPathFromPodIdentifier(podIdentifier, "ingress"): {
+					Program: goebpfprogs.BpfProgram{ProgID: 2, ProgFD: 3},
+					Maps: map[string]goebpfmaps.BpfMap{
+						utils.TC_INGRESS_MAP:           {MapFD: 100},
+						utils.TC_INGRESS_POD_STATE_MAP: {MapFD: 101},
+					},
+				},
+				utils.GetBPFPinPathFromPodIdentifier(podIdentifier, "egress"): {
+					Program: goebpfprogs.BpfProgram{ProgID: 4, ProgFD: 5},
+					Maps: map[string]goebpfmaps.BpfMap{
+						utils.TC_EGRESS_MAP:           {MapFD: 110},
+						utils.TC_EGRESS_POD_STATE_MAP: {MapFD: 111},
+					},
+				},
+			}, map[string]goebpfmaps.BpfMap{}, nil
+		}).AnyTimes()
 
-	pod := types.NamespacedName{Name: "nginx-abc123", Namespace: "default"}
-	podIdentifier := utils.GetPodIdentifier(pod.Name, pod.Namespace)
-	podNamespacedName := utils.GetPodNamespacedName(pod.Name, pod.Namespace)
+	testBpfClient := newAttachTestClient(t, podIdentifier, mockBpfSDK, mockTCClient)
 
-	testBpfClient := &bpfClient{
-		hostMask:                  "/32",
-		policyEndpointeBPFContext: new(sync.Map),
-		bpfSDKClient:              mockBpfSDK,
-		bpfTCClient:               mockTCClient,
-		ingressPodToProgMap:       new(sync.Map),
-		egressPodToProgMap:        new(sync.Map),
-		ingressProgToPodsMap:      new(sync.Map),
-		egressProgToPodsMap:       new(sync.Map),
-		podIdentifierLock:         new(sync.Map),
-		deletedPods:               new(sync.Map),
+	const workers = 8
+	const iterations = 40
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				pod := types.NamespacedName{
+					Name:      fmt.Sprintf("web-abc123-w%dn%d", w, i),
+					Namespace: "default",
+				}
+				if err := testBpfClient.AttacheBPFProbes(pod, podIdentifier, 1); err != nil {
+					t.Errorf("attach failed for %s: %v", pod.Name, err)
+					return
+				}
+				if err := testBpfClient.DeleteBPFProbes(pod, podIdentifier); err != nil {
+					t.Errorf("delete failed for %s: %v", pod.Name, err)
+					return
+				}
+			}
+		}(w)
 	}
-	testBpfClient.policyEndpointeBPFContext.Store(podIdentifier, BPFContext{
-		ingressPgmInfo: goelf.BpfData{Program: goebpfprogs.BpfProgram{ProgID: 2, ProgFD: 3}},
-		egressPgmInfo:  goelf.BpfData{Program: goebpfprogs.BpfProgram{ProgID: 4, ProgFD: 5}},
-	})
-	utils.GetHostVethName = func(_, _ string, _ int, _ []string) (string, error) {
-		return "mockedveth0", nil
+	wg.Wait()
+
+	// Once every pod has been deleted nothing may still be counted against the
+	// shared programs; a survivor here is the stale entry that keeps
+	// isProgFdShared true for the last pod and leaks its pins.
+	for _, m := range []struct {
+		name string
+		set  *sync.Map
+	}{
+		{"ingressProgToPodsMap", testBpfClient.ingressProgToPodsMap},
+		{"egressProgToPodsMap", testBpfClient.egressProgToPodsMap},
+	} {
+		m.set.Range(func(progFD, raw any) bool {
+			assert.Empty(t, raw.(map[string]struct{}),
+				"%s still counts pods against progFD %v after all pods were deleted", m.name, progFD)
+			return true
+		})
 	}
-
-	// Delete then clear — simulates CNI DEL followed by CNI ADD
-	testBpfClient.deletedPods.Store(podNamespacedName, time.Now())
-	testBpfClient.ClearDeletedPod(podNamespacedName)
-
-	err := testBpfClient.AttacheBPFProbes(pod, podIdentifier, 1)
-	assert.NoError(t, err)
-
-	_, attached := testBpfClient.ingressPodToProgMap.Load(podNamespacedName)
-	assert.True(t, attached)
+	// And the lock registry must not retain entries once every holder is done.
+	assert.Equal(t, 0, testBpfClient.podIdentifierLockRefs(podIdentifier))
 }
 
 func TestDeleteBPFProbes_AddsPodToDeletedMap(t *testing.T) {
@@ -1171,7 +1316,6 @@ func TestDeleteBPFProbes_AddsPodToDeletedMap(t *testing.T) {
 		egressPodToProgMap:   new(sync.Map),
 		ingressProgToPodsMap: new(sync.Map),
 		egressProgToPodsMap:  new(sync.Map),
-		podIdentifierLock:    new(sync.Map),
 		deletedPods:          new(sync.Map),
 	}
 

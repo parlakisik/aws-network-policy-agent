@@ -155,7 +155,6 @@ func NewBpfClient(ctx context.Context, nodeIP string, enablePolicyEventLogs, ena
 		globalMaps:                      new(sync.Map),
 		ingressProgToPodsMap:            new(sync.Map),
 		egressProgToPodsMap:             new(sync.Map),
-		podIdentifierLock:               new(sync.Map),
 		podNameToInterfaceCount:         new(sync.Map),
 		networkPolicyMode:               networkPolicyMode,
 		isMultiNICEnabled:               isMultiNICEnabled,
@@ -338,8 +337,12 @@ type bpfClient struct {
 	ingressProgToPodsMap *sync.Map
 	// Stores the Egress eBPF Prog FD to pods mapping
 	egressProgToPodsMap *sync.Map
-	// Stores podIdentifier to operations lock mapping
-	podIdentifierLock *sync.Map
+	// Stores podIdentifier to operations lock mapping. Guarded by
+	// podIdentifierLockMu; entries are reference-counted so a lock is never
+	// removed while a goroutine holds or waits for it. Use lockPodIdentifier
+	// rather than touching this directly.
+	podIdentifierLocks  map[string]*identifierLock
+	podIdentifierLockMu sync.Mutex
 	// This is only updated and used for probe binary updates during initialization
 	interfaceNametoIngressPinPath map[string]string
 	// This is only updated and used for probe binary updates during initialization
@@ -363,6 +366,70 @@ type bpfClient struct {
 	clusterPolicyEgressInMemoryMap *sync.Map
 	// This is in-memory map to track recently deleted pods (key: podNamespacedName, value: time added to map)
 	deletedPods *sync.Map
+	// Guards the inner map[string]struct{} values of ingress/egressProgToPodsMap.
+	// sync.Map protects only the outer map; the inner sets are plain Go maps, and
+	// a progFD is a recycled kernel fd number that can be shared by two different
+	// podIdentifiers, so the per-identifier lock is not sufficient to serialize
+	// them. Concurrent access to a plain map is a fatal runtime throw, not a
+	// recoverable error, so this must not rely on caller discipline.
+	progToPodsMu sync.Mutex
+}
+
+// identifierLock is the per-podIdentifier critical-section lock plus a reference
+// count of goroutines currently holding or waiting for it.
+//
+// The count exists so the registry entry can be reclaimed without ever removing
+// a lock somebody is using. Deleting a held entry lets the next caller mint a
+// second mutex for the same identifier and enter the critical section
+// concurrently, which silently defeats every invariant the lock protects --
+// including the deletedPods re-check in AttacheBPFProbes.
+type identifierLock struct {
+	mu sync.Mutex
+	// refs is guarded by bpfClient.podIdentifierLockMu, not by mu.
+	refs int
+}
+
+// lockPodIdentifier acquires the critical-section lock for podIdentifier and
+// returns the function that releases it. The returned func must be called
+// exactly once, and callers must not touch the lock afterwards.
+func (l *bpfClient) lockPodIdentifier(podIdentifier string) func() {
+	l.podIdentifierLockMu.Lock()
+	if l.podIdentifierLocks == nil {
+		l.podIdentifierLocks = make(map[string]*identifierLock)
+	}
+	entry, ok := l.podIdentifierLocks[podIdentifier]
+	if !ok {
+		entry = &identifierLock{}
+		l.podIdentifierLocks[podIdentifier] = entry
+	}
+	// Claim a reference before releasing the registry lock so the entry cannot be
+	// reclaimed between here and the Lock() below.
+	entry.refs++
+	l.podIdentifierLockMu.Unlock()
+
+	entry.mu.Lock()
+
+	return func() {
+		entry.mu.Unlock()
+		l.podIdentifierLockMu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(l.podIdentifierLocks, podIdentifier)
+		}
+		l.podIdentifierLockMu.Unlock()
+	}
+}
+
+// podIdentifierLockRefs reports how many goroutines hold or are waiting for
+// podIdentifier's lock. Used to keep the deletedPods GC from retiring a
+// tombstone out from under a goroutine that is still parked on the lock.
+func (l *bpfClient) podIdentifierLockRefs(podIdentifier string) int {
+	l.podIdentifierLockMu.Lock()
+	defer l.podIdentifierLockMu.Unlock()
+	if entry, ok := l.podIdentifierLocks[podIdentifier]; ok {
+		return entry.refs
+	}
+	return 0
 }
 
 func checkAndUpdateBPFBinaries(bpfTCClient tc.BpfTc, bpfBinaries []string, hostBinaryPath string) (bool, bool, bool, error) {
@@ -724,11 +791,9 @@ func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier str
 
 	// Two go routines can try to attach the probes at the same time
 	// Locking will help updating all the datastructures correctly
-	value, _ := l.podIdentifierLock.LoadOrStore(podIdentifier, &sync.Mutex{})
-	podIdentifierLock := value.(*sync.Mutex)
-	podIdentifierLock.Lock()
+	unlockPodIdentifier := l.lockPodIdentifier(podIdentifier)
 	log().Debugf("Got the podIdentifierLock for Pod: %s, Namespace: %s, PodIdentifier: %s", pod.Name, pod.Namespace, podIdentifier)
-	defer podIdentifierLock.Unlock()
+	defer unlockPodIdentifier()
 
 	// Check if an eBPF probe is already attached on both ingress and egress direction(s) for this pod.
 	// If yes, then skip probe attach flow for this pod.
@@ -784,16 +849,23 @@ func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier str
 	}
 	if !isIngressProbeAttached {
 		l.ingressPodToProgMap.Store(podNamespacedName, ingressProgFD)
-		currentPodSet, _ := l.ingressProgToPodsMap.LoadOrStore(ingressProgFD, make(map[string]struct{}))
-		currentPodSet.(map[string]struct{})[podNamespacedName] = struct{}{}
+		l.addPodToProgSet(l.ingressProgToPodsMap, ingressProgFD, podNamespacedName)
 	}
 
 	if !isEgressProbeAttached {
 		l.egressPodToProgMap.Store(podNamespacedName, egressProgFD)
-		currentPodSet, _ := l.egressProgToPodsMap.LoadOrStore(egressProgFD, make(map[string]struct{}))
-		currentPodSet.(map[string]struct{})[podNamespacedName] = struct{}{}
+		l.addPodToProgSet(l.egressProgToPodsMap, egressProgFD, podNamespacedName)
 	}
 	return nil
+}
+
+// addPodToProgSet records podNamespacedName against progFD in progToPodsMap.
+// Holds progToPodsMu because the value is a plain Go map: see the field comment.
+func (l *bpfClient) addPodToProgSet(progToPodsMap *sync.Map, progFD int, podNamespacedName string) {
+	l.progToPodsMu.Lock()
+	defer l.progToPodsMu.Unlock()
+	currentPodSet, _ := progToPodsMap.LoadOrStore(progFD, make(map[string]struct{}))
+	currentPodSet.(map[string]struct{})[podNamespacedName] = struct{}{}
 }
 
 func (l *bpfClient) attachIngressBPFProbe(hostVethName string, podIdentifier string) (int, error) {
@@ -901,10 +973,8 @@ func (l *bpfClient) HasBPFContext(podIdentifier string) bool {
 }
 
 func (l *bpfClient) DeleteBPFProbes(pod types.NamespacedName, podIdentifier string) error {
-	value, _ := l.podIdentifierLock.LoadOrStore(podIdentifier, &sync.Mutex{})
-	podIdentifierLock := value.(*sync.Mutex)
-	podIdentifierLock.Lock()
-	defer podIdentifierLock.Unlock()
+	unlockPodIdentifier := l.lockPodIdentifier(podIdentifier)
+	defer unlockPodIdentifier()
 	log().Debugf("Got the podIdentifierLock for Pod: %s Namespace: %s PodIdentifier: %s", pod.Name, pod.Namespace, podIdentifier)
 
 	isProgFdShared, err := l.isProgFdShared(pod.Name, pod.Namespace)
@@ -918,7 +988,12 @@ func (l *bpfClient) DeleteBPFProbes(pod types.NamespacedName, podIdentifier stri
 			log().Errorf("BPF programs and Maps delete failed for podIdentifier: %s, error: %v", podIdentifier, err)
 			return err
 		}
-		l.podIdentifierLock.Delete(podIdentifier)
+		// Deliberately no lock-registry removal here. Dropping the entry while this
+		// goroutine still holds it lets the next caller mint a second mutex for the
+		// same podIdentifier and run concurrently with anyone parked on the first --
+		// which breaks the mutual exclusion the deletedPods re-check in
+		// AttacheBPFProbes depends on. lockPodIdentifier reclaims the entry by
+		// reference count once the last holder releases it.
 	}
 	return nil
 }
@@ -1364,29 +1439,23 @@ func (l *bpfClient) isProgFdShared(targetPodName string, targetPodNamespace stri
 	targetpodNamespacedName := utils.GetPodNamespacedName(targetPodName, targetPodNamespace)
 	// check ingress caches
 	if targetProgFD, ok := l.ingressPodToProgMap.Load(targetpodNamespacedName); ok {
-		if currentList, ok := l.ingressProgToPodsMap.Load(targetProgFD); ok {
-			podsList, ok := currentList.(map[string]struct{})
-			if ok {
-				if len(podsList) > 1 {
-					log().Debugf("Found shared ingress progFD for target: %s, progFD: %d", targetPodName, targetProgFD)
-					return true, nil
-				}
-				return false, nil // Not shared (only one pod)
+		if count, ok := l.podsSharingProgFD(l.ingressProgToPodsMap, targetProgFD); ok {
+			if count > 1 {
+				log().Debugf("Found shared ingress progFD for target: %s, progFD: %d", targetPodName, targetProgFD)
+				return true, nil
 			}
+			return false, nil // Not shared (only one pod)
 		}
 	}
 
 	// Check Egress Maps if not found in Ingress
 	if targetProgFD, ok := l.egressPodToProgMap.Load(targetpodNamespacedName); ok {
-		if currentList, ok := l.egressProgToPodsMap.Load(targetProgFD); ok {
-			podsList, ok := currentList.(map[string]struct{})
-			if ok {
-				if len(podsList) > 1 {
-					log().Debugf("Found shared egress progFD for target: %s, progFD: %d", targetPodName, targetProgFD)
-					return true, nil
-				}
-				return false, nil // Not shared (only one pod)
+		if count, ok := l.podsSharingProgFD(l.egressProgToPodsMap, targetProgFD); ok {
+			if count > 1 {
+				log().Debugf("Found shared egress progFD for target: %s, progFD: %d", targetPodName, targetProgFD)
+				return true, nil
 			}
+			return false, nil // Not shared (only one pod)
 		}
 	}
 
@@ -1439,13 +1508,7 @@ func (l *bpfClient) deletePodFromIngressProgPodCaches(podName string, podNamespa
 	podNamespacedName := utils.GetPodNamespacedName(podName, podNamespace)
 	if progFD, ok := l.ingressPodToProgMap.Load(podNamespacedName); ok {
 		l.ingressPodToProgMap.Delete(podNamespacedName)
-		if currentSet, ok := l.ingressProgToPodsMap.Load(progFD); ok {
-			set := currentSet.(map[string]struct{})
-			delete(set, podNamespacedName)
-			if len(set) == 0 {
-				l.ingressProgToPodsMap.Delete(progFD)
-			}
-		}
+		l.removePodFromProgSet(l.ingressProgToPodsMap, progFD, podNamespacedName)
 	}
 }
 
@@ -1453,14 +1516,39 @@ func (l *bpfClient) deletePodFromEgressProgPodCaches(podName string, podNamespac
 	podNamespacedName := utils.GetPodNamespacedName(podName, podNamespace)
 	if progFD, ok := l.egressPodToProgMap.Load(podNamespacedName); ok {
 		l.egressPodToProgMap.Delete(podNamespacedName)
-		if currentSet, ok := l.egressProgToPodsMap.Load(progFD); ok {
-			set := currentSet.(map[string]struct{})
-			delete(set, podNamespacedName)
-			if len(set) == 0 {
-				l.egressProgToPodsMap.Delete(progFD)
-			}
+		l.removePodFromProgSet(l.egressProgToPodsMap, progFD, podNamespacedName)
+	}
+}
+
+// removePodFromProgSet drops podNamespacedName from progFD's set, retiring the
+// set once empty. Holds progToPodsMu because the value is a plain Go map: see
+// the field comment.
+func (l *bpfClient) removePodFromProgSet(progToPodsMap *sync.Map, progFD any, podNamespacedName string) {
+	l.progToPodsMu.Lock()
+	defer l.progToPodsMu.Unlock()
+	if currentSet, ok := progToPodsMap.Load(progFD); ok {
+		set := currentSet.(map[string]struct{})
+		delete(set, podNamespacedName)
+		if len(set) == 0 {
+			progToPodsMap.Delete(progFD)
 		}
 	}
+}
+
+// podsSharingProgFD reports the number of pods recorded against progFD.
+// Holds progToPodsMu because the value is a plain Go map: see the field comment.
+func (l *bpfClient) podsSharingProgFD(progToPodsMap *sync.Map, progFD any) (int, bool) {
+	l.progToPodsMu.Lock()
+	defer l.progToPodsMu.Unlock()
+	currentList, ok := progToPodsMap.Load(progFD)
+	if !ok {
+		return 0, false
+	}
+	podsList, ok := currentList.(map[string]struct{})
+	if !ok {
+		return 0, false
+	}
+	return len(podsList), true
 }
 
 // startDeletedPodsCleanupRoutine cleans up entries from the deletedPods map that are older than deletedPodsMinAge.

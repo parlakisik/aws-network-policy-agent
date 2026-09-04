@@ -102,7 +102,27 @@ var (
 		func() float64 { return float64(goebpfmetrics.ProgLoadEAGAINExhausted()) },
 	)
 
+	// AttacheBPFProbes suppresses an attach when the pod is known to have been
+	// deleted. Both suppression points log at Debug, which is off in production,
+	// so without this counter there is no way to tell "never needed" from
+	// "firing constantly". The stage label distinguishes the cheap pre-lock
+	// check from the post-lock re-check that closes the attach-after-delete
+	// race; a non-zero post_lock rate proves that race occurs in the field.
+	attachSuppressedPodDeleted = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "awsnodeagent_attach_suppressed_pod_deleted_total",
+			Help: "Attach attempts suppressed because the pod was already deleted, by the check that caught it",
+		},
+		[]string{"stage"},
+	)
+
 	prometheusRegistered = false
+)
+
+// Stages reported by the attachSuppressedPodDeleted counter.
+const (
+	suppressionStagePreLock  = "pre_lock"
+	suppressionStagePostLock = "post_lock"
 )
 
 type pod_state struct {
@@ -119,12 +139,13 @@ func prometheusRegister() {
 		metrics.Registry.MustRegister(sdkAPIErr)
 		metrics.Registry.MustRegister(sdkProgLoadEAGAINRetries)
 		metrics.Registry.MustRegister(sdkProgLoadEAGAINExhausted)
+		metrics.Registry.MustRegister(attachSuppressedPodDeleted)
 		prometheusRegistered = true
 	}
 }
 
 type BpfClient interface {
-	AttacheBPFProbes(pod types.NamespacedName, podIdentifier string, numInterfaces int) error
+	AttacheBPFProbes(pod types.NamespacedName, podIdentifier string, numInterfaces int, podConfirmedLive bool) (bool, error)
 	DeleteBPFProbes(pod types.NamespacedName, podIdentifier string) error
 	UpdateClusterPolicyEbpfMaps(podIdentifier string, ingressFirewallRules []fwrp.EbpfFirewallRules, egressFirewallRules []fwrp.EbpfFirewallRules) error
 	UpdateEbpfMaps(podIdentifier string, ingressFirewallRules []fwrp.EbpfFirewallRules, egressFirewallRules []fwrp.EbpfFirewallRules) error
@@ -155,7 +176,6 @@ func NewBpfClient(ctx context.Context, nodeIP string, enablePolicyEventLogs, ena
 		globalMaps:                      new(sync.Map),
 		ingressProgToPodsMap:            new(sync.Map),
 		egressProgToPodsMap:             new(sync.Map),
-		podIdentifierLock:               new(sync.Map),
 		podNameToInterfaceCount:         new(sync.Map),
 		networkPolicyMode:               networkPolicyMode,
 		isMultiNICEnabled:               isMultiNICEnabled,
@@ -338,8 +358,11 @@ type bpfClient struct {
 	ingressProgToPodsMap *sync.Map
 	// Stores the Egress eBPF Prog FD to pods mapping
 	egressProgToPodsMap *sync.Map
-	// Stores podIdentifier to operations lock mapping
-	podIdentifierLock *sync.Map
+	// Stores podIdentifier to operations lock mapping. Entries are never removed:
+	// deleting one while a goroutine holds it lets the next caller mint a second
+	// mutex for the same identifier and enter the critical section concurrently.
+	// Held by value so the zero bpfClient is usable and no caller can leave it nil.
+	podIdentifierLock sync.Map
 	// This is only updated and used for probe binary updates during initialization
 	interfaceNametoIngressPinPath map[string]string
 	// This is only updated and used for probe binary updates during initialization
@@ -711,15 +734,44 @@ func (l *bpfClient) getInterfaceCountForPod(pod types.NamespacedName, podIdentif
 	return 0, errors.New("Skipping probe attach: multiNIC enabled and interface count is unknown")
 }
 
-func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier string, numInterfaces int) error {
+// suppressAttachForDeletedPod reports whether podNamespacedName carries a
+// deletion tombstone, counting and logging the suppression against the check
+// that caught it.
+func (l *bpfClient) suppressAttachForDeletedPod(pod types.NamespacedName, podIdentifier, podNamespacedName, stage string) bool {
+	if _, deleted := l.deletedPods.Load(podNamespacedName); !deleted {
+		return false
+	}
+	attachSuppressedPodDeleted.WithLabelValues(stage).Inc()
+	log().Debugf("ignoring attaching ebpf probe to pod %s in namespace %s with pod identifier %s: deleted (detected at %s check)",
+		pod.Name, pod.Namespace, podIdentifier, stage)
+	return true
+}
+
+// AttacheBPFProbes attaches the ingress and egress TC probes for pod.
+//
+// podConfirmedLive tells the client the caller has authoritative evidence the
+// pod exists right now -- in practice, a CNI ADD arriving over the Enforce RPC.
+// Such a caller clears any deletion tombstone (under the same lock that writes
+// it) and is never skipped, because skipping a live pod would leave it with no
+// probes and therefore unenforced. Reconciler callers pass false: they derive
+// their work list from PolicyEndpoint caches that can name pods which no longer
+// exist, so for them a tombstone must veto the attach.
+//
+// The first return value reports whether probes are attached for the pod when
+// the call returns -- false means the attach was deliberately skipped. Callers
+// must not treat a skip as success: skipped is not an error, but it is also not
+// "programmed".
+func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier string, numInterfaces int, podConfirmedLive bool) (bool, error) {
 	var ingressProgFD int
 	var egressProgFD int
 
 	podNamespacedName := utils.GetPodNamespacedName(pod.Name, pod.Namespace)
 
-	if _, deleted := l.deletedPods.Load(podNamespacedName); deleted {
-		log().Debugf("ignoring attaching ebpf probe to pod %s in namespace %s with pod identifier %s as it is already deleted", pod.Name, pod.Namespace, podIdentifier)
-		return nil
+	// Cheap pre-lock check: a pod tombstoned before we even contend for the lock
+	// needs no further work. This is an optimization only -- correctness comes
+	// from the re-check below.
+	if !podConfirmedLive && l.suppressAttachForDeletedPod(pod, podIdentifier, podNamespacedName, suppressionStagePreLock) {
+		return false, nil
 	}
 
 	// Two go routines can try to attach the probes at the same time
@@ -730,17 +782,35 @@ func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier str
 	log().Debugf("Got the podIdentifierLock for Pod: %s, Namespace: %s, PodIdentifier: %s", pod.Name, pod.Namespace, podIdentifier)
 	defer podIdentifierLock.Unlock()
 
+	if podConfirmedLive {
+		// The pod demonstrably exists, so any tombstone is stale -- it belongs to a
+		// previous pod that reused this name, or to a DEL that raced this ADD. Drop
+		// it here, under the lock that DeleteBPFProbes uses to write it, so no
+		// concurrent delete can reinstate it between this point and the attach.
+		l.deletedPods.Delete(podNamespacedName)
+	} else if l.suppressAttachForDeletedPod(pod, podIdentifier, podNamespacedName, suppressionStagePostLock) {
+		// Re-check the tombstone now that we hold podIdentifierLock. DeleteBPFProbes
+		// records it while holding this same lock, so the pre-lock check above can be
+		// stale: a delete may have completed while we were blocked here. Attaching in
+		// that window re-inserts the pod into the shared progFD -> pods set, and
+		// nothing removes it again because no further CNI DEL arrives for a pod that
+		// is already torn down. The stale entry keeps isProgFdShared true for the last
+		// remaining pod of this podIdentifier, so its programs and maps are never
+		// unpinned and the pins leak permanently.
+		return false, nil
+	}
+
 	// Check if an eBPF probe is already attached on both ingress and egress direction(s) for this pod.
 	// If yes, then skip probe attach flow for this pod.
 	isIngressProbeAttached, isEgressProbeAttached := l.isEBPFProbeAttached(pod.Name, pod.Namespace)
 	if isIngressProbeAttached && isEgressProbeAttached {
-		return nil
+		return true, nil
 	}
 
 	// Determine the actual number of interfaces to attach probes to
 	actualInterfaceCount, err := l.getInterfaceCountForPod(pod, podIdentifier, numInterfaces)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	numInterfaces = actualInterfaceCount
@@ -751,7 +821,7 @@ func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier str
 		hostVethName, err := utils.GetHostVethName(pod.Name, pod.Namespace, index, []string{POD_VETH_PREFIX, BRANCH_ENI_VETH_PREFIX})
 		if err != nil {
 			log().Warnf("Failed to attach ebpf probes for pod %s in namespace %s. Pod might have been deleted", pod.Name, pod.Namespace)
-			return err
+			return false, err
 		}
 
 		log().Infof("AttacheBPFProbes for pod %s in namespace %s with hostVethName %s at interface %d", pod.Name, pod.Namespace, hostVethName, index)
@@ -764,7 +834,7 @@ func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier str
 			if err != nil {
 				log().Errorf("Failed to Attach Ingress TC probe for pod: %s in namespace %s at interface %d error: %v", pod.Name, pod.Namespace, index, err)
 				sdkAPIErr.WithLabelValues("attachIngressBPFProbe").Inc()
-				return err
+				return false, err
 			}
 			log().Infof("Successfully attached Ingress TC probe for pod: %s in namespace %s at interface %d", pod.Name, pod.Namespace, index)
 		}
@@ -777,7 +847,7 @@ func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier str
 			if err != nil {
 				log().Errorf("Failed to Attach Egress TC probe for pod: %s in namespace %s at interface %d error: %v", pod.Name, pod.Namespace, index, err)
 				sdkAPIErr.WithLabelValues("attachEgressBPFProbe").Inc()
-				return err
+				return false, err
 			}
 			log().Infof("Successfully attached Egress TC probe for pod: %s in namespace %s at interface %d", pod.Name, pod.Namespace, index)
 		}
@@ -793,7 +863,7 @@ func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier str
 		currentPodSet, _ := l.egressProgToPodsMap.LoadOrStore(egressProgFD, make(map[string]struct{}))
 		currentPodSet.(map[string]struct{})[podNamespacedName] = struct{}{}
 	}
-	return nil
+	return true, nil
 }
 
 func (l *bpfClient) attachIngressBPFProbe(hostVethName string, podIdentifier string) (int, error) {
@@ -918,7 +988,13 @@ func (l *bpfClient) DeleteBPFProbes(pod types.NamespacedName, podIdentifier stri
 			log().Errorf("BPF programs and Maps delete failed for podIdentifier: %s, error: %v", podIdentifier, err)
 			return err
 		}
-		l.podIdentifierLock.Delete(podIdentifier)
+		// Deliberately no podIdentifierLock.Delete here. Dropping the entry while
+		// this goroutine still holds the mutex lets the next caller create a second
+		// mutex for the same podIdentifier and enter the critical section
+		// concurrently -- which breaks the mutual exclusion that the deletedPods
+		// re-check above depends on, and makes concurrent writes to the plain maps
+		// inside ingress/egressProgToPodsMap reachable ("fatal error: concurrent
+		// map writes").
 	}
 	return nil
 }
@@ -1366,13 +1442,14 @@ func (l *bpfClient) isProgFdShared(targetPodName string, targetPodNamespace stri
 	if targetProgFD, ok := l.ingressPodToProgMap.Load(targetpodNamespacedName); ok {
 		if currentList, ok := l.ingressProgToPodsMap.Load(targetProgFD); ok {
 			podsList, ok := currentList.(map[string]struct{})
-			if ok {
-				if len(podsList) > 1 {
-					log().Debugf("Found shared ingress progFD for target: %s, progFD: %d", targetPodName, targetProgFD)
-					return true, nil
-				}
-				return false, nil // Not shared (only one pod)
+			if !ok {
+				return false, fmt.Errorf("unexpected type in ingressProgToPodsMap for progFD %v", targetProgFD)
 			}
+			if len(podsList) > 1 {
+				log().Debugf("Found shared ingress progFD for target: %s, progFD: %d", targetPodName, targetProgFD)
+				return true, nil
+			}
+			return false, nil // Not shared (only one pod)
 		}
 	}
 
@@ -1380,13 +1457,14 @@ func (l *bpfClient) isProgFdShared(targetPodName string, targetPodNamespace stri
 	if targetProgFD, ok := l.egressPodToProgMap.Load(targetpodNamespacedName); ok {
 		if currentList, ok := l.egressProgToPodsMap.Load(targetProgFD); ok {
 			podsList, ok := currentList.(map[string]struct{})
-			if ok {
-				if len(podsList) > 1 {
-					log().Debugf("Found shared egress progFD for target: %s, progFD: %d", targetPodName, targetProgFD)
-					return true, nil
-				}
-				return false, nil // Not shared (only one pod)
+			if !ok {
+				return false, fmt.Errorf("unexpected type in egressProgToPodsMap for progFD %v", targetProgFD)
 			}
+			if len(podsList) > 1 {
+				log().Debugf("Found shared egress progFD for target: %s, progFD: %d", targetPodName, targetProgFD)
+				return true, nil
+			}
+			return false, nil // Not shared (only one pod)
 		}
 	}
 

@@ -21,6 +21,8 @@ import (
 	fwrp "github.com/aws/aws-network-policy-agent/pkg/fwruleprocessor"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
 	"github.com/golang/mock/gomock"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -528,7 +530,7 @@ func TestBpfClient_AttacheBPFProbes(t *testing.T) {
 				return fmt.Sprintf("mockedveth%d", interfaceIndex), nil
 			}
 
-			_, gotError := testBpfClient.AttacheBPFProbes(tt.testPod, tt.podIdentifier, tt.numInterfaces, false)
+			gotError := testBpfClient.AttacheBPFProbes(tt.testPod, tt.podIdentifier, tt.numInterfaces, false)
 			assert.Equal(t, tt.wantErr, gotError)
 		})
 	}
@@ -911,7 +913,7 @@ func TestBpfClient_AttacheBPFProbes_MultipleInterfacesFlow(t *testing.T) {
 		return fmt.Sprintf("mockedveth%d", interfaceIndex), nil
 	}
 
-	_, err := testBpfClient.AttacheBPFProbes(testPod, podIdentifier, 2, false)
+	err := testBpfClient.AttacheBPFProbes(testPod, podIdentifier, 2, false)
 	assert.NoError(t, err)
 
 	podNamespacedName := utils.GetPodNamespacedName(testPod.Name, testPod.Namespace)
@@ -1098,6 +1100,52 @@ func TestIsProgFdShared(t *testing.T) {
 	}
 }
 
+// suppressionCount reads one stage's counter value without pulling in testutil.
+func suppressionCount(t *testing.T, stage string) float64 {
+	t.Helper()
+	c, err := attachSuppressedPodDeleted.GetMetricWithLabelValues(stage)
+	assert.NoError(t, err)
+	var m dto.Metric
+	assert.NoError(t, c.Write(&m))
+	return m.GetCounter().GetValue()
+}
+
+// A CounterVec exports nothing for a label until first used, so without
+// pre-initialisation the metric is absent from /metrics until the first
+// suppression -- observed on a live cluster, and useless for a dashboard.
+func TestAttachSuppressionCounter_ExportsBothStagesFromStartup(t *testing.T) {
+	// Reset first so the assertion does not depend on which tests ran before.
+	attachSuppressedPodDeleted.Reset()
+	initAttachSuppressionSeries()
+
+	ch := make(chan prometheus.Metric, 8)
+	attachSuppressedPodDeleted.Collect(ch)
+	close(ch)
+	assert.Equal(t, 2, len(ch),
+		"both pre_lock and post_lock series must exist before any suppression happens")
+}
+
+// And it must actually count, per stage.
+func TestAttachSuppressionCounter_IncrementsForTheStageThatFired(t *testing.T) {
+	prometheusRegister()
+
+	pod := types.NamespacedName{Name: "nginx-abc123", Namespace: "default"}
+	podIdentifier := utils.GetPodIdentifier(pod.Name, pod.Namespace)
+	podNamespacedName := utils.GetPodNamespacedName(pod.Name, pod.Namespace)
+
+	c := &bpfClient{deletedPods: new(sync.Map)}
+	before := suppressionCount(t, suppressionStagePostLock)
+
+	// No tombstone yet: nothing to suppress, nothing to count.
+	assert.False(t, c.suppressAttachForDeletedPod(pod, podIdentifier, podNamespacedName, suppressionStagePostLock))
+	assert.Equal(t, before, suppressionCount(t, suppressionStagePostLock))
+
+	c.deletedPods.Store(podNamespacedName, time.Now())
+	assert.True(t, c.suppressAttachForDeletedPod(pod, podIdentifier, podNamespacedName, suppressionStagePostLock))
+	assert.Equal(t, before+1, suppressionCount(t, suppressionStagePostLock),
+		"a post_lock suppression must increment the post_lock series")
+}
+
 // restoreGetHostVethName registers cleanup that puts the package-level
 // utils.GetHostVethName back after a test replaces it. Without this a stub leaks
 // into every later test in the package and results become order-dependent.
@@ -1178,9 +1226,8 @@ func TestAttacheBPFProbes_SkipsDeletedPod(t *testing.T) {
 	pod := types.NamespacedName{Name: "nginx-abc123", Namespace: "default"}
 	testBpfClient.deletedPods.Store(utils.GetPodNamespacedName(pod.Name, pod.Namespace), time.Now())
 
-	attached, err := testBpfClient.AttacheBPFProbes(pod, utils.GetPodIdentifier(pod.Name, pod.Namespace), 1, false)
-	assert.NoError(t, err)
-	assert.False(t, attached, "a skipped attach must not report itself as attached")
+	err := testBpfClient.AttacheBPFProbes(pod, utils.GetPodIdentifier(pod.Name, pod.Namespace), 1, false)
+	assert.ErrorIs(t, err, ErrAttachSkippedPodDeleted, "a skip must be reported as ErrAttachSkippedPodDeleted")
 }
 
 // A caller with authoritative evidence the pod exists (a CNI ADD) must never be
@@ -1207,9 +1254,8 @@ func TestAttacheBPFProbes_ProceedsWhenPodConfirmedLive(t *testing.T) {
 	// drop it, under the lock, because the caller knows the pod is live.
 	testBpfClient.deletedPods.Store(podNamespacedName, time.Now())
 
-	attached, err := testBpfClient.AttacheBPFProbes(pod, podIdentifier, 1, true)
-	assert.NoError(t, err)
-	assert.True(t, attached)
+	err := testBpfClient.AttacheBPFProbes(pod, podIdentifier, 1, true)
+	assert.NoError(t, err, "a confirmed-live attach must never be skipped")
 
 	_, ingressAttached := testBpfClient.ingressPodToProgMap.Load(podNamespacedName)
 	assert.True(t, ingressAttached)
@@ -1247,8 +1293,7 @@ func TestAttacheBPFProbes_SkipsPodDeletedWhileWaitingForLock(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := testBpfClient.AttacheBPFProbes(pod, podIdentifier, 1, false)
-		done <- err
+		done <- testBpfClient.AttacheBPFProbes(pod, podIdentifier, 1, false)
 	}()
 
 	// Give the goroutine time to pass the pre-lock check and park on Lock(). With
@@ -1269,7 +1314,7 @@ func TestAttacheBPFProbes_SkipsPodDeletedWhileWaitingForLock(t *testing.T) {
 
 	select {
 	case err := <-done:
-		assert.NoError(t, err)
+		assert.ErrorIs(t, err, ErrAttachSkippedPodDeleted)
 	case <-time.After(5 * time.Second):
 		t.Fatal("AttacheBPFProbes did not return after podIdentifierLock was released")
 	}
@@ -1342,7 +1387,7 @@ func TestAttachDeleteConcurrentOnOneIdentifier(t *testing.T) {
 				}
 				// podConfirmedLive=true mirrors the CNI ADD path, which must not be
 				// vetoed by another pod's tombstone.
-				if _, err := testBpfClient.AttacheBPFProbes(pod, podIdentifier, 1, true); err != nil {
+				if err := testBpfClient.AttacheBPFProbes(pod, podIdentifier, 1, true); err != nil {
 					t.Errorf("attach failed for %s: %v", pod.Name, err)
 					return
 				}

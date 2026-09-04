@@ -45,18 +45,21 @@ type MockBpfClient struct {
 	// podIdentifiers with no registered eBPF context. Empty by default so HasBPFContext
 	// reports true, preserving the original success-path behavior.
 	PodIdentifiersWithoutBPFContext map[string]bool
-	// AttachSkipped makes AttacheBPFProbes report that it deliberately skipped the
-	// attach (pod already deleted) instead of attaching.
+	// AttachSkipped makes AttacheBPFProbes return ErrAttachSkippedPodDeleted
+	// instead of attaching.
 	AttachSkipped bool
 	// LastAttachPodConfirmedLive records the podConfirmedLive argument of the most
 	// recent AttacheBPFProbes call.
 	LastAttachPodConfirmedLive bool
 }
 
-func (m *MockBpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier string, numInterfaces int, podConfirmedLive bool) (bool, error) {
+func (m *MockBpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier string, numInterfaces int, podConfirmedLive bool) error {
 	m.CallLog = append(m.CallLog, "AttacheBPFProbes")
 	m.LastAttachPodConfirmedLive = podConfirmedLive
-	return !m.AttachSkipped, nil
+	if m.AttachSkipped {
+		return ErrAttachSkippedPodDeleted
+	}
+	return nil
 }
 
 func (m *MockBpfClient) DeleteBPFProbes(pod types.NamespacedName, podIdentifier string) error {

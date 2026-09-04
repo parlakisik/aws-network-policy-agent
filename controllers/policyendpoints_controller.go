@@ -358,14 +358,15 @@ func (r *PolicyEndpointsReconciler) configureeBPFProbes(ctx context.Context, pod
 
 		// podConfirmedLive=false: this work list comes from PolicyEndpoint caches,
 		// which can still name pods that no longer exist on the node.
-		attached, err := r.ebpfClient.AttacheBPFProbes(pod.NamespacedName, podIdentifier, ebpf.INTERFACE_COUNT_UNKNOWN, false)
-		if err != nil {
+		if err := r.ebpfClient.AttacheBPFProbes(pod.NamespacedName, podIdentifier, ebpf.INTERFACE_COUNT_UNKNOWN, false); err != nil {
+			// A deleted pod is expected here, not a failure: work lists come from
+			// PolicyEndpoint caches that can still name pods that are already gone.
+			if errors.Is(err, ebpf.ErrAttachSkippedPodDeleted) {
+				log().Debugf("Skipped eBPF probe attach for deleted pod: %s in namespace %s", pod.Name, pod.Namespace)
+				continue
+			}
 			log().Errorf("Failed to attach eBPF probes for pod %s namespace %s : %v", pod.Name, pod.Namespace, err)
 			return err
-		}
-		if !attached {
-			log().Debugf("Skipped eBPF probe attach for deleted pod: %s in namespace %s", pod.Name, pod.Namespace)
-			continue
 		}
 		log().Infof("Successfully attached required eBPF probes for pod: %s in namespace %s", pod.Name, pod.Namespace)
 	}

@@ -124,6 +124,26 @@ func initAttachSuppressionSeries() {
 	attachSuppressedPodDeleted.WithLabelValues(suppressionStagePostLock)
 }
 
+// Number of mutexes shared across podIdentifiers. Not a limit on identifiers:
+// they are hashed onto these locks, so two identifiers may share one and simply
+// serialize against each other, which is always safe.
+const podIdentifierLockShards = 256
+
+// lockFor returns the mutex guarding podIdentifier's critical section.
+func (l *bpfClient) lockFor(podIdentifier string) *sync.Mutex {
+	return &l.podIdentifierLocks[shardIndex(podIdentifier)]
+}
+
+// shardIndex is FNV-1a inlined to avoid allocating a hash.Hash per call.
+func shardIndex(s string) uint32 {
+	h := uint32(2166136261)
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	return h % podIdentifierLockShards
+}
+
 // ErrAttachSkippedPodDeleted is returned when an attach is deliberately not
 // performed because the pod is already deleted. It is an outcome, not a failure:
 // reconcilers should skip such a pod, while a CNI ADD caller must treat it as an
@@ -370,10 +390,10 @@ type bpfClient struct {
 	ingressProgToPodsMap *sync.Map
 	// Stores the Egress eBPF Prog FD to pods mapping
 	egressProgToPodsMap *sync.Map
-	// podIdentifier -> operations lock. Entries are never removed: deleting one
-	// while held lets the next caller mint a second mutex for the same identifier
-	// and enter concurrently. By value, so the zero bpfClient is usable.
-	podIdentifierLock sync.Map
+	// Locks guarding per-podIdentifier critical sections, sharded over a fixed
+	// array: nothing is allocated or removed, so a lock can never be deleted while
+	// a goroutine holds or waits for it. See lockFor.
+	podIdentifierLocks [podIdentifierLockShards]sync.Mutex
 	// This is only updated and used for probe binary updates during initialization
 	interfaceNametoIngressPinPath map[string]string
 	// This is only updated and used for probe binary updates during initialization
@@ -781,8 +801,7 @@ func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier str
 
 	// Two go routines can try to attach the probes at the same time
 	// Locking will help updating all the datastructures correctly
-	value, _ := l.podIdentifierLock.LoadOrStore(podIdentifier, &sync.Mutex{})
-	podIdentifierLock := value.(*sync.Mutex)
+	podIdentifierLock := l.lockFor(podIdentifier)
 	podIdentifierLock.Lock()
 	log().Debugf("Got the podIdentifierLock for Pod: %s, Namespace: %s, PodIdentifier: %s", pod.Name, pod.Namespace, podIdentifier)
 	defer podIdentifierLock.Unlock()
@@ -970,8 +989,7 @@ func (l *bpfClient) HasBPFContext(podIdentifier string) bool {
 }
 
 func (l *bpfClient) DeleteBPFProbes(pod types.NamespacedName, podIdentifier string) error {
-	value, _ := l.podIdentifierLock.LoadOrStore(podIdentifier, &sync.Mutex{})
-	podIdentifierLock := value.(*sync.Mutex)
+	podIdentifierLock := l.lockFor(podIdentifier)
 	podIdentifierLock.Lock()
 	defer podIdentifierLock.Unlock()
 	log().Debugf("Got the podIdentifierLock for Pod: %s Namespace: %s PodIdentifier: %s", pod.Name, pod.Namespace, podIdentifier)
@@ -987,9 +1005,8 @@ func (l *bpfClient) DeleteBPFProbes(pod types.NamespacedName, podIdentifier stri
 			log().Errorf("BPF programs and Maps delete failed for podIdentifier: %s, error: %v", podIdentifier, err)
 			return err
 		}
-		// Deliberately no podIdentifierLock.Delete: removing an entry while holding it
-		// lets the next caller create a second mutex for this identifier and enter
-		// concurrently, breaking the re-check above and the plain-map writes below.
+		// No lock cleanup here: locks are a fixed shard array, never allocated per
+		// identifier, so there is nothing that could be removed while still in use.
 	}
 	return nil
 }

@@ -1100,6 +1100,32 @@ func TestIsProgFdShared(t *testing.T) {
 	}
 }
 
+// Locks are sharded over a fixed array, so the same identifier must always map to
+// the same mutex, every index must be in range, and identifiers must spread out
+// rather than piling onto one shard.
+func TestLockFor_ShardingIsStableAndInRange(t *testing.T) {
+	c := &bpfClient{}
+
+	// Same identifier -> same mutex, every time.
+	for _, id := range []string{"web-abc123@default", "api-xyz789@prod", ""} {
+		assert.Same(t, c.lockFor(id), c.lockFor(id), "identifier %q mapped to two different mutexes", id)
+	}
+
+	// Distinct identifiers spread across shards instead of collapsing onto one.
+	seen := map[uint32]int{}
+	for i := 0; i < 4096; i++ {
+		idx := shardIndex(fmt.Sprintf("rs-%d@ns%d", i, i%7))
+		assert.Less(t, idx, uint32(podIdentifierLockShards), "shard index out of range")
+		seen[idx]++
+	}
+	assert.Equal(t, podIdentifierLockShards, len(seen),
+		"4096 identifiers should reach every shard; got %d", len(seen))
+
+	// Two identifiers sharing a shard is expected and safe -- assert it can happen
+	// so the test documents the trade-off rather than pretending it cannot.
+	assert.Greater(t, seen[shardIndex("rs-0@ns0")], 1, "expected shard reuse across identifiers")
+}
+
 // suppressionCount reads one stage's counter value without pulling in testutil.
 func suppressionCount(t *testing.T, stage string) float64 {
 	t.Helper()
@@ -1287,8 +1313,7 @@ func TestAttacheBPFProbes_SkipsPodDeletedWhileWaitingForLock(t *testing.T) {
 
 	// Hold podIdentifierLock so the attach below parks on it, standing in for an
 	// in-flight DeleteBPFProbes which holds this same lock.
-	value, _ := testBpfClient.podIdentifierLock.LoadOrStore(podIdentifier, &sync.Mutex{})
-	heldLock := value.(*sync.Mutex)
+	heldLock := testBpfClient.lockFor(podIdentifier)
 	heldLock.Lock()
 
 	done := make(chan error, 1)

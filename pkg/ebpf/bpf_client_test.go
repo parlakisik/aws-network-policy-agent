@@ -694,7 +694,13 @@ func TestRecoverBPFState(t *testing.T) {
 			},
 		).AnyTimes()
 
+		mockTCClient.EXPECT().GetAllAttachedProgIds().Return(map[string]int{}, map[string]int{}, nil).AnyTimes()
+
 		t.Run(tt.name, func(t *testing.T) {
+			// recoverBPFState reads the pin directories, so keep this test off
+			// the host's bpffs.
+			redirectPinDirsToTemp(t)
+
 			policyEndpointeBPFContext := new(sync.Map)
 			globapMaps := new(sync.Map)
 			gotIsConntrackMapPresent, gotIsPolicyEventsMapPresent, gotEventsMapFD, _, _, gotError := NewMockBpfClient().recoverBPFState(mockTCClient, mockBpfClient, policyEndpointeBPFContext, globapMaps,

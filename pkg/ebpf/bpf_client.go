@@ -2,7 +2,6 @@ package ebpf
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -13,7 +12,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/aws/amazon-vpc-cni-k8s/pkg/ipamd/datastore"
 	goelf "github.com/aws/aws-ebpf-sdk-go/pkg/elfparser"
 	goebpfmaps "github.com/aws/aws-ebpf-sdk-go/pkg/maps"
 	goebpfmetrics "github.com/aws/aws-ebpf-sdk-go/pkg/metrics"
@@ -57,7 +55,6 @@ var (
 	BRANCH_ENI_VETH_PREFIX                           = "vlan"
 	INTERFACE_COUNT_UNKNOWN                          = -1 // Used when caller doesn't know interface count
 	INTERFACE_COUNT_DEFAULT                          = 1  // Default single interface
-	IPAM_JSON_PATH                                   = "/var/run/aws-node/ipam.json"
 	deletedPodsMinAge                                = 5 * time.Minute
 )
 
@@ -296,7 +293,7 @@ func NewBpfClient(ctx context.Context, nodeIP string, enablePolicyEventLogs, ena
 
 	// Load ipam.json data only when multi-NIC is enabled for interface counts
 	if ebpfClient.isMultiNICEnabled {
-		err = ebpfClient.loadIPAMDataFromFile(IPAM_JSON_PATH)
+		err = ebpfClient.loadIPAMDataFromFile(ipamCheckpointPath)
 		if err != nil {
 			log().Errorf("Failed to load IPAM data: %v", err)
 			return nil, err
@@ -348,6 +345,8 @@ type bpfClient struct {
 	networkPolicyMode string
 	// multi nic enabled flag
 	isMultiNICEnabled bool
+	// program reader used by the boot pin cleanup, nil to use the eBPF SDK
+	progInspector progPinInspector
 	// maps pod namespaced name to interface count
 	// This is loaded once at startup and will not be up to date on new pod info
 	podNameToInterfaceCount *sync.Map
@@ -423,11 +422,15 @@ func (l *bpfClient) recoverBPFState(bpfTCClient tc.BpfTc, eBPFSDKClient goelf.Bp
 	if err := migrateLegacyPinsFromCNIState(
 		utils.BPF_PROGRAMS_PIN_PATH_DIRECTORY,
 		utils.BPF_MAPS_PIN_PATH_DIRECTORY,
-		cniIpamStatePath,
+		ipamCheckpointPath,
 		formatV2MarkerPath,
 	); err != nil {
 		log().Errorf("legacy pin migration failed (non-fatal): %v", err)
 	}
+
+	// Runs before the recovery below, which opens an fd per pin and would keep an
+	// orphaned program resident.
+	l.reclaimOrphanPinsAtBoot(bpfTCClient)
 
 	// Recover global maps (Conntrack and Events) if there is no need to update
 	// events binary
@@ -649,31 +652,21 @@ func (l *bpfClient) GetNetworkPolicyMode() string {
 
 // loadIPAMDataFromFile reads IPAM JSON file from specified path and caches pod to interface count mapping
 func (l *bpfClient) loadIPAMDataFromFile(filePath string) error {
-	data, err := os.ReadFile(filePath)
+	pods, err := loadIPAMCheckpointPods(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to read ipam.json file: %v", err)
-	}
-
-	var checkpointData datastore.CheckpointData
-	if err := json.Unmarshal(data, &checkpointData); err != nil {
-		return fmt.Errorf("failed to parse ipam.json: %v", err)
+		return err
 	}
 
 	// Store interface count per pod from IPAM data
-	for _, entry := range checkpointData.Allocations {
-		// Skip entries with missing pod information
-		if entry.Metadata.K8SPodName == "" || entry.Metadata.K8SPodNamespace == "" {
-			continue
-		}
-
-		podNamespacedName := utils.GetPodNamespacedName(entry.Metadata.K8SPodName, entry.Metadata.K8SPodNamespace)
-		if entry.Metadata.InterfacesCount > 0 {
-			l.podNameToInterfaceCount.Store(podNamespacedName, entry.Metadata.InterfacesCount)
-			log().Debugf("Cached interface count for pod %s: %d", podNamespacedName, entry.Metadata.InterfacesCount)
+	for _, pod := range pods {
+		podNamespacedName := utils.GetPodNamespacedName(pod.Name, pod.Namespace)
+		if pod.InterfacesCount > 0 {
+			l.podNameToInterfaceCount.Store(podNamespacedName, pod.InterfacesCount)
+			log().Debugf("Cached interface count for pod %s: %d", podNamespacedName, pod.InterfacesCount)
 		}
 	}
 
-	log().Infof("Loaded IPAM data from %d allocations", len(checkpointData.Allocations))
+	log().Infof("Loaded IPAM data from %d allocations", len(pods))
 	return nil
 }
 

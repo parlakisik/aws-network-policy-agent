@@ -1,7 +1,6 @@
 package ebpf
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,26 +10,10 @@ import (
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
 )
 
-// cniIpamStatePath is VPC CNI's per-pod allocation checkpoint; already on a
-// path the NPA container mounts.
-const cniIpamStatePath = "/var/run/aws-node/ipam.json"
-
 // formatV2MarkerPath is the sentinel file written after a successful one-shot
 // legacy-format migration. Its presence makes the migration a no-op on every
 // subsequent agent restart.
 const formatV2MarkerPath = "/var/run/aws-node/.npa_format_v2"
-
-type ipamAllocation struct {
-	Metadata struct {
-		K8sPodName      string `json:"k8sPodName"`
-		K8sPodNamespace string `json:"k8sPodNamespace"`
-	} `json:"metadata"`
-}
-
-type ipamStateFile struct {
-	Version     string           `json:"version"`
-	Allocations []ipamAllocation `json:"allocations"`
-}
 
 // migrateLegacyPinsFromCNIState renames per-pod bpffs pin files from the
 // legacy "-" separator format to the new "_" format. Runs once per node;
@@ -42,26 +25,18 @@ func migrateLegacyPinsFromCNIState(progsDir, mapsDir, ipamPath, markerPath strin
 		return fmt.Errorf("checking migration marker %s: %w", markerPath, err)
 	}
 
-	raw, err := os.ReadFile(ipamPath)
+	pods, err := loadIPAMCheckpointPods(ipamPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("read CNI ipam state %s: %w", ipamPath, err)
+		return err
 	}
 
-	var state ipamStateFile
-	if err := json.Unmarshal(raw, &state); err != nil {
-		return fmt.Errorf("parse CNI ipam state %s: %w", ipamPath, err)
-	}
-
-	byLegacyID := map[string][]ipamAllocation{}
-	for _, a := range state.Allocations {
-		if a.Metadata.K8sPodName == "" || a.Metadata.K8sPodNamespace == "" {
-			continue
-		}
-		legacyID := utils.LegacyGetPodIdentifier(a.Metadata.K8sPodName, a.Metadata.K8sPodNamespace)
-		byLegacyID[legacyID] = append(byLegacyID[legacyID], a)
+	byLegacyID := map[string][]ipamPod{}
+	for _, pod := range pods {
+		legacyID := utils.LegacyGetPodIdentifier(pod.Name, pod.Namespace)
+		byLegacyID[legacyID] = append(byLegacyID[legacyID], pod)
 	}
 
 	var totalFailed int
@@ -72,20 +47,20 @@ func migrateLegacyPinsFromCNIState(progsDir, mapsDir, ipamPath, markerPath strin
 		// pod's pin gets renamed; the other pods will get fresh per-pod pins
 		// via the reconcile loop's normal attach path.
 		sort.Slice(pods, func(i, j int) bool {
-			return pods[i].Metadata.K8sPodName < pods[j].Metadata.K8sPodName
+			return pods[i].Name < pods[j].Name
 		})
 		p := pods[0]
-		newID := utils.GetPodIdentifier(p.Metadata.K8sPodName, p.Metadata.K8sPodNamespace)
+		newID := utils.GetPodIdentifier(p.Name, p.Namespace)
 
 		if len(pods) > 1 {
 			log().Infof("legacy pin %s shared by %d local pods; inheriting to first pod %s/%s (%s); other pods get fresh pins via reconcile",
-				legacyID, len(pods), p.Metadata.K8sPodNamespace, p.Metadata.K8sPodName, newID)
+				legacyID, len(pods), p.Namespace, p.Name, newID)
 		}
 		renamed, failed := renamePinFamily(progsDir, mapsDir, legacyID, newID)
 		totalFailed += failed
 		if renamed > 0 {
 			log().Infof("migrated %d bpffs pin file(s) for %s/%s: %s -> %s",
-				renamed, p.Metadata.K8sPodNamespace, p.Metadata.K8sPodName, legacyID, newID)
+				renamed, p.Namespace, p.Name, legacyID, newID)
 		}
 	}
 
@@ -103,28 +78,18 @@ func migrateLegacyPinsFromCNIState(progsDir, mapsDir, ipamPath, markerPath strin
 	return nil
 }
 
+// renamePinFamily renames every pin of one podIdentifier.
 func renamePinFamily(progsDir, mapsDir, legacyID, newID string) (renamed int, failed int) {
-	for _, dir := range []string{"ingress", "egress"} {
-		progName := utils.TC_INGRESS_PROG
-		if dir == "egress" {
-			progName = utils.TC_EGRESS_PROG
-		}
-		switch renamePinIfExists(progsDir+legacyID+"_"+progName, progsDir+newID+"_"+progName) {
+	for _, suffix := range progPinSuffixes() {
+		switch renamePinIfExists(progsDir+legacyID+"_"+suffix, progsDir+newID+"_"+suffix) {
 		case renameOK:
 			renamed++
 		case renameFailed:
 			failed++
 		}
 	}
-	for _, mapName := range []string{
-		utils.TC_INGRESS_MAP,
-		utils.TC_EGRESS_MAP,
-		utils.TC_CLUSTER_POLICY_INGRESS_MAP,
-		utils.TC_CLUSTER_POLICY_EGRESS_MAP,
-		utils.TC_INGRESS_POD_STATE_MAP,
-		utils.TC_EGRESS_POD_STATE_MAP,
-	} {
-		switch renamePinIfExists(mapsDir+legacyID+"_"+mapName, mapsDir+newID+"_"+mapName) {
+	for _, suffix := range mapPinSuffixes() {
+		switch renamePinIfExists(mapsDir+legacyID+"_"+suffix, mapsDir+newID+"_"+suffix) {
 		case renameOK:
 			renamed++
 		case renameFailed:

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -694,7 +695,15 @@ func TestRecoverBPFState(t *testing.T) {
 			},
 		).AnyTimes()
 
+		mockTCClient.EXPECT().GetAllAttachedProgIds().Return(map[string]int{}, map[string]int{}, nil).AnyTimes()
+
 		t.Run(tt.name, func(t *testing.T) {
+			// recoverBPFState reads the pin directories and the IPAM checkpoint, and
+			// the legacy migration it runs can write the format marker. Keep all
+			// three off the host.
+			redirectPinDirsToTemp(t)
+			redirectIPAMCheckpointPath(t, filepath.Join(t.TempDir(), "ipam.json"))
+
 			policyEndpointeBPFContext := new(sync.Map)
 			globapMaps := new(sync.Map)
 			gotIsConntrackMapPresent, gotIsPolicyEventsMapPresent, gotEventsMapFD, _, _, gotError := NewMockBpfClient().recoverBPFState(mockTCClient, mockBpfClient, policyEndpointeBPFContext, globapMaps,

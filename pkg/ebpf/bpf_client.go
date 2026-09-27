@@ -294,6 +294,15 @@ func NewBpfClient(ctx context.Context, nodeIP string, enablePolicyEventLogs, ena
 		go wait.Forever(ebpfClient.conntrackClient.CleanupConntrackMap, halfDuration)
 	}
 
+	// V2377427643: periodically reclaim stale, unreplied SYN_SENT netfilter
+	// conntrack entries left by NetworkPolicy-denied traffic, so they cannot
+	// exhaust the node's conntrack table. Node-wide; independent of the policy
+	// events pipeline (no ring-buffer dependency) and needs no kfuncs.
+	netfilterSweepFilter := newStaleSynSentFilter()
+	log().Infof("Starting netfilter conntrack sweeper: interval=%s synSentIdleFloor=%s synSentTimeout=%ds",
+		netfilterSweepInterval, netfilterSynSentIdleFloor, netfilterSweepFilter.fullTimeoutSec)
+	go wait.Forever(func() { sweepStaleSynSentConntrack(netfilterSweepFilter) }, netfilterSweepInterval)
+
 	// Load ipam.json data only when multi-NIC is enabled for interface counts
 	if ebpfClient.isMultiNICEnabled {
 		err = ebpfClient.loadIPAMDataFromFile(IPAM_JSON_PATH)

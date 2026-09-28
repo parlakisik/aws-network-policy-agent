@@ -2,6 +2,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+#include "tcp_rst.h"
 
 #define BPF_F_NO_PREALLOC 1
 #define ETH_HLEN 14
@@ -444,7 +445,7 @@ int handle_ingress(struct __sk_buff *skb)
 				int ret = evaluateFlow(trie_key, flow_key, ct_pod_state_val, &evt, pst->state);
 				if (ret == BPF_DROP) {
 					bpf_map_delete_elem(&aws_conntrack_map, &flow_key);
-					return BPF_DROP;
+					return reject_with_rst_v4(skb); // V2377427643: RST instead of silent drop
 				}
 				return BPF_OK;
 			}
@@ -469,7 +470,10 @@ int handle_ingress(struct __sk_buff *skb)
 		}
 
 		// If we reach here, it means it's a new flow or a non-matching response
-		return evaluateFlow(trie_key, flow_key, ct_pod_state_val, &evt, pst->state);
+		int rst_verdict = evaluateFlow(trie_key, flow_key, ct_pod_state_val, &evt, pst->state);
+		if (rst_verdict == BPF_DROP)
+			return reject_with_rst_v4(skb); // V2377427643: RST instead of silent drop
+		return rst_verdict;
 	}
 	return BPF_OK;
 }
